@@ -6,6 +6,7 @@ pub mod namespace_tools;
 pub mod openai_compat;
 pub mod responses;
 pub mod systemone;
+pub(crate) mod tool_result_media;
 pub mod vertex;
 pub mod vertex_gemini;
 

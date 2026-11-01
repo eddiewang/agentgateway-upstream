@@ -95,6 +95,7 @@ pub mod from_messages {
 	use types::messages::typed as messages;
 
 	use crate::conversion::GeminiThoughtSignature;
+	use crate::conversion::tool_result_media::{self, ToolResultMedia};
 	use crate::parse::sse::SseJsonEvent;
 	use crate::types::ResponseType;
 	use crate::{AIError, StreamingUsageGuard, json, logged_response_parsing, types};
@@ -825,6 +826,18 @@ pub mod from_messages {
 		}
 	}
 
+	fn image_part(source: &serde_json::Value) -> Option<completions::RequestUserMessageContentPart> {
+		let url = anthropic_source_to_url(source)?;
+		Some(completions::RequestUserMessageContentPart::ImageUrl(
+			completions::RequestMessageContentPartImage {
+				image_url: completions::ImageUrl { url, detail: None },
+				// OpenAI rejects cache breakpoints on image parts even though the
+				// Chat Completions schema exposes this field.
+				prompt_cache_breakpoint: None,
+			},
+		))
+	}
+
 	#[allow(deprecated)]
 	fn translate_internal(req: messages::Request) -> completions::Request {
 		let messages::Request {
@@ -900,6 +913,7 @@ pub mod from_messages {
 			});
 
 		let mut msgs: Vec<completions::RequestMessage> = Vec::new();
+		let mut tool_media = ToolResultMedia::default();
 
 		// Preserve system block boundaries regardless of caching metadata.
 		if let Some(system) = system {
@@ -951,16 +965,7 @@ pub mod from_messages {
 								));
 							},
 							messages::ContentBlock::Image(messages::ContentImageBlock { source, .. }) => {
-								if let Some(url) = anthropic_source_to_url(&source) {
-									parts.push(completions::RequestUserMessageContentPart::ImageUrl(
-										completions::RequestMessageContentPartImage {
-											image_url: completions::ImageUrl { url, detail: None },
-											// OpenAI rejects cache breakpoints on image parts even though the
-											// Chat Completions schema exposes this field.
-											prompt_cache_breakpoint: None,
-										},
-									));
-								}
+								parts.extend(image_part(&source));
 							},
 							messages::ContentBlock::ToolResult {
 								tool_use_id,
@@ -968,6 +973,7 @@ pub mod from_messages {
 								cache_control,
 								..
 							} => {
+								let mut media = Vec::new();
 								let tool_content = match content {
 									ToolResultContent::Text(t) => match cache_breakpoint(cache_control) {
 										Some(breakpoint) => completions::RequestToolMessageContent::Array(vec![
@@ -1000,8 +1006,24 @@ pub mod from_messages {
 														prompt_cache_breakpoint: cache_breakpoint(cache_control),
 													},
 												)),
-												ToolResultContentPart::Image { cache_control, .. }
-												| ToolResultContentPart::Document { cache_control, .. }
+												ToolResultContentPart::Image {
+													source,
+													cache_control,
+												} => {
+													if supports_prompt_cache_breakpoint {
+														trailing_cache_control = trailing_cache_control.or(cache_control);
+													}
+													if let Some(image) = image_part(&source) {
+														tool_parts.push(completions::RequestToolMessageContentPart::Text(
+															completions::RequestMessageContentPartText {
+																text: tool_result_media::PLACEHOLDER.to_string(),
+																prompt_cache_breakpoint: None,
+															},
+														));
+														media.push(image);
+													}
+												},
+												ToolResultContentPart::Document { cache_control, .. }
 												| ToolResultContentPart::SearchResult { cache_control, .. } => {
 													if supports_prompt_cache_breakpoint {
 														trailing_cache_control = trailing_cache_control.or(cache_control);
@@ -1028,12 +1050,14 @@ pub mod from_messages {
 										completions::RequestToolMessageContent::Array(tool_parts)
 									},
 								};
-								msgs.push(completions::RequestMessage::Tool(
+								tool_media.push(
+									&mut msgs,
 									completions::RequestToolMessage {
 										content: tool_content,
 										tool_call_id: tool_use_id,
 									},
-								));
+									media,
+								);
 							},
 							messages::ContentBlock::ServerToolUse { .. }
 							| messages::ContentBlock::ToolUse { .. } => {},
@@ -1176,6 +1200,7 @@ pub mod from_messages {
 				},
 			}
 		}
+		let msgs = tool_media.insert(msgs);
 
 		let tools: Vec<completions::Tool> = tools
 			.into_iter()

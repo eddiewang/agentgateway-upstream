@@ -163,3 +163,64 @@ fn responses_user_images_become_chat_image_parts() {
 		])
 	);
 }
+
+#[test]
+fn responses_tool_output_images_follow_the_tool_messages_in_a_user_message() {
+	use crate::conversion::tool_result_media::{LABEL, PLACEHOLDER};
+
+	let png = "data:image/png;base64,iVBORw0KGgo=";
+	let request: crate::types::responses::Request = serde_json::from_value(json!({
+		"model": "vision-model",
+		"input": [
+			{"role": "user", "content": "Compare the two screenshots."},
+			{"type": "function_call", "call_id": "call_1", "name": "view_image", "arguments": "{\"path\":\"a.png\"}"},
+			{"type": "function_call", "call_id": "call_2", "name": "view_image", "arguments": "{\"path\":\"b.png\"}"},
+			{
+				"type": "function_call_output",
+				"call_id": "call_1",
+				"output": [
+					{"type": "input_text", "text": "a.png"},
+					{"type": "input_image", "image_url": png, "detail": "high"}
+				]
+			},
+			{
+				"type": "function_call_output",
+				"call_id": "call_2",
+				"output": [{"type": "input_image", "image_url": "https://example.com/b.png"}]
+			},
+			{"type": "function_call", "call_id": "call_3", "name": "shell", "arguments": "{}"},
+			{"type": "function_call_output", "call_id": "call_3", "output": "done"}
+		]
+	}))
+	.unwrap();
+
+	let translated = super::from_responses::translate_request(&request).unwrap();
+	let body: Value = serde_json::to_value(&translated.request).unwrap();
+
+	let call = |id: &str, name: &str, arguments: &str| json!({"type": "function", "id": id, "function": {"name": name, "arguments": arguments}});
+	assert_eq!(
+		body["messages"],
+		json!([
+			{"role": "user", "content": "Compare the two screenshots."},
+			{
+				"role": "assistant",
+				"tool_calls": [
+					call("call_1", "view_image", "{\"path\":\"a.png\"}"),
+					call("call_2", "view_image", "{\"path\":\"b.png\"}")
+				]
+			},
+			{"role": "tool", "content": format!("a.png\n{PLACEHOLDER}"), "tool_call_id": "call_1"},
+			{"role": "tool", "content": PLACEHOLDER, "tool_call_id": "call_2"},
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": LABEL},
+					{"type": "image_url", "image_url": {"url": png, "detail": "high"}},
+					{"type": "image_url", "image_url": {"url": "https://example.com/b.png", "detail": "auto"}}
+				]
+			},
+			{"role": "assistant", "tool_calls": [call("call_3", "shell", "{}")]},
+			{"role": "tool", "content": "done", "tool_call_id": "call_3"}
+		])
+	);
+}

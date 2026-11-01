@@ -6,6 +6,7 @@ pub mod from_responses {
 	use types::completions::typed as completions;
 	use types::responses::typed as responses;
 
+	use crate::conversion::tool_result_media::{self, ToolResultMedia};
 	use crate::{AIError, json, types};
 
 	pub struct TranslatedRequest {
@@ -68,6 +69,27 @@ pub mod from_responses {
 		}
 	}
 
+	/// Split a tool output into the text of its `tool` message and the media for the user message
+	/// after the tool messages. A media part leaves a placeholder line in the text.
+	fn tool_output_content(
+		parts: Vec<responses::InputContent>,
+	) -> (String, Vec<completions::RequestUserMessageContentPart>) {
+		let mut lines = Vec::new();
+		let mut media = Vec::new();
+		for part in parts {
+			match part {
+				responses::InputContent::InputText(text) => lines.push(text.text),
+				part => {
+					if let Some(part) = user_content_part(part) {
+						lines.push(tool_result_media::PLACEHOLDER.to_string());
+						media.push(part);
+					}
+				},
+			}
+		}
+		(lines.join("\n"), media)
+	}
+
 	fn translate_internal(req: responses::CreateResponse) -> completions::Request {
 		use responses::{
 			EasyInputContent, InputContent, InputItem, InputMessage, InputParam, InputRole,
@@ -76,6 +98,7 @@ pub mod from_responses {
 		};
 
 		let mut messages: Vec<completions::RequestMessage> = Vec::new();
+		let mut tool_media = ToolResultMedia::default();
 		let mut gemini_signatures = std::collections::HashMap::new();
 
 		if let Some(instructions) = &req.instructions {
@@ -320,23 +343,18 @@ pub mod from_responses {
 						let Some(call_id) = output.call_id.filter(|call_id| !call_id.is_empty()) else {
 							continue;
 						};
-						let output_text = match output.output {
-							responses::FunctionCallOutput::Text(text) => text,
-							responses::FunctionCallOutput::Content(parts) => parts
-								.iter()
-								.filter_map(|part| match part {
-									InputContent::InputText(t) => Some(t.text.clone()),
-									_ => None,
-								})
-								.collect::<Vec<_>>()
-								.join("\n"),
+						let (output_text, media) = match output.output {
+							responses::FunctionCallOutput::Text(text) => (text, Vec::new()),
+							responses::FunctionCallOutput::Content(parts) => tool_output_content(parts),
 						};
-						messages.push(completions::RequestMessage::Tool(
+						tool_media.push(
+							&mut messages,
 							completions::RequestToolMessage {
 								content: completions::RequestToolMessageContent::Text(output_text),
 								tool_call_id: call_id,
 							},
-						));
+							media,
+						);
 					},
 					Item::CustomToolCall(call) => {
 						let arguments = serde_json::to_string(&call.input).unwrap_or_else(|_| "{}".to_string());
@@ -377,6 +395,7 @@ pub mod from_responses {
 				},
 			}
 		}
+		let messages = tool_media.insert(messages);
 
 		let tools: Option<Vec<completions::Tool>> = req.tools.as_ref().map(|tools| {
 			tools
